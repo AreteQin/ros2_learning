@@ -1,72 +1,95 @@
-// subscribe to gps and image data
-// and use approximate time synchronization
-//
-// Created by qin on 2/29/24.
-//
-
-#include <iostream>
 #include <chrono>
-#include <rclcpp/rclcpp.hpp>
-#include <cv_bridge/cv_bridge.h>
-#include <opencv2/core/core.hpp>
-#include <vision_msgs/msg/detection2_d_array.hpp>
-#include <message_filters/time_synchronizer.h>
+#include <memory>
+
 #include <message_filters/subscriber.h>
-#include <glog/logging.h>
-#include <image_transport/image_transport.hpp>
-#include <geometry_msgs/msg/pose_array.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
-#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/time_synchronizer.h>    
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/temperature.hpp>
 
-using namespace std;
+using namespace std::chrono_literals;
 
-void
-ImageGpsCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg,
-                 const sensor_msgs::msg::NavSatFix::ConstSharedPtr& msg_drone_GPS)
-{
-    cout << "ImageGpsCallback" << endl;
-    // print GPS data
-    cout << "GPS: " << msg_drone_GPS->latitude << ", " << msg_drone_GPS->longitude << endl;
-    // show image
-    cv_bridge::CvImagePtr cv_ptr;
-    try
-    {
-        cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-    }
-    catch (cv_bridge::Exception& e)
-    {
-        RCLCPP_ERROR(rclcpp::get_logger("cv_bridge"), "cv_bridge exception: %s", e.what());
-        return;
-    }
-}
+class SyncerNode : public rclcpp::Node {
+ public:
+  SyncerNode() : Node("syncer") {
+    rclcpp::QoS qos(10);
+    auto rmw_qos_profile = qos.get_rmw_qos_profile();
 
-int main(int argc, char** argv)
-{
-    rclcpp::init(argc, argv);
+    publisher_temp1_ =
+        this->create_publisher<sensor_msgs::msg::Temperature>("temp_1", qos);
+    publisher_temp2_ =
+        this->create_publisher<sensor_msgs::msg::Temperature>("temp_2", qos);
 
-    auto node = rclcpp::Node::make_shared("fire_localization");
-    // set image_transport parameter to "compressed"
-    node->declare_parameter<std::string>("image_transport", "compressed");
+    timer_ = this->create_wall_timer(
+        500ms, std::bind(&SyncerNode::TimerCallback, this));
 
-    // message filter for images
-    image_transport::ImageTransport it(node);
-    message_filters::Subscriber<sensor_msgs::msg::Image> sub_image
-        (node, "/dji_osdk_ros/main_wide_RGB");
-    message_filters::Subscriber<sensor_msgs::msg::NavSatFix> sub_drone_GPS
-        (node, "/dji_osdk_ros/gps_position");
+    subscriber_temp1_.subscribe(this, "temp_1", rmw_qos_profile);
+    subscriber_temp2_.subscribe(this, "temp_2", rmw_qos_profile);
 
-    // Sync the subscribed data
-    typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image,
-                                                            sensor_msgs::msg::NavSatFix> approximate_policy;
-    message_filters::Synchronizer<approximate_policy> syncApproximate(approximate_policy(100),
-                                                                      sub_image,
-                                                                      sub_drone_GPS);
-    syncApproximate.setMaxIntervalDuration(rclcpp::Duration(3, 0));
-    syncApproximate.registerCallback(std::bind(std::placeholders::_1, std::placeholders::_2));
+    // // Uncomment this to verify that the messages indeed reach the
+    // subscriber_temp1_.registerCallback(
+    //     std::bind(&SyncerNode::Tmp1Callback, this, std::placeholders::_1));
+    // subscriber_temp2_.registerCallback(
+    //     std::bind(&SyncerNode::Tmp2Callback, this, std::placeholders::_1));
 
-    rclcpp::spin(node);
-    rclcpp::shutdown();
+    temp_sync_ = std::make_shared<message_filters::TimeSynchronizer<sensor_msgs::msg::Temperature, sensor_msgs::msg::Temperature>>(subscriber_temp1_, subscriber_temp2_, 10);
+    temp_sync_->registerCallback(std::bind(&SyncerNode::TempSyncCallback, this, std::placeholders::_1, std::placeholders::_2));
+  }
 
-    return 0;
+ private:
+  void TimerCallback() {
+    rclcpp::Time now = this->get_clock()->now();
+
+    auto msg_tmp1 = sensor_msgs::msg::Temperature();
+    msg_tmp1.header.stamp = now;
+    msg_tmp1.header.frame_id = "test";
+    msg_tmp1.temperature = 1.0;
+
+    auto msg_tmp2 = sensor_msgs::msg::Temperature();
+    msg_tmp2.header.stamp = now;
+    msg_tmp2.header.frame_id = "test";
+    msg_tmp2.temperature = 2.0;
+
+    publisher_temp1_->publish(msg_tmp1);
+    publisher_temp2_->publish(msg_tmp2);
+
+    RCLCPP_INFO(this->get_logger(), "Published two temperatures.");
+  }
+
+  // For veryfing the single subscriber instances: Uncomment line 26-28.
+  void Tmp1Callback(const sensor_msgs::msg::Temperature::ConstSharedPtr& msg) {
+    RCLCPP_INFO(this->get_logger(), "Frame '%s', temp %f with ts %u.%u sec ",
+                msg->header.frame_id.c_str(), msg->temperature,
+                msg->header.stamp.sec, msg->header.stamp.nanosec);
+  }
+
+  // For veryfing the single subscriber instances: Uncomment line 29-31.
+  void Tmp2Callback(const sensor_msgs::msg::Temperature::ConstSharedPtr& msg) {
+    RCLCPP_INFO(this->get_logger(), "Frame '%s', temp %f with ts %u.%u sec ",
+                msg->header.frame_id.c_str(), msg->temperature,
+                msg->header.stamp.sec, msg->header.stamp.nanosec);
+  }
+
+  // This callback is never being called.
+  void TempSyncCallback(
+      const sensor_msgs::msg::Temperature::ConstSharedPtr& msg_1,
+      const sensor_msgs::msg::Temperature::ConstSharedPtr& msg_2) {
+    RCLCPP_INFO(this->get_logger(),
+                "I heard and synchronized the following timestamps: %u, %u",
+                msg_1->header.stamp.sec, msg_2->header.stamp.sec);
+  }
+
+  rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr publisher_temp1_;
+  rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr publisher_temp2_;
+  message_filters::Subscriber<sensor_msgs::msg::Temperature> subscriber_temp1_;
+  message_filters::Subscriber<sensor_msgs::msg::Temperature> subscriber_temp2_;
+  std::shared_ptr<message_filters::TimeSynchronizer<sensor_msgs::msg::Temperature, sensor_msgs::msg::Temperature>> temp_sync_;
+
+  rclcpp::TimerBase::SharedPtr timer_;
+};
+
+int main(int argc, char* argv[]) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<SyncerNode>());
+  rclcpp::shutdown();
+  return 0;
 }
